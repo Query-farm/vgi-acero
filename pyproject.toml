@@ -1,0 +1,139 @@
+[project]
+name = "vgi-acero"
+version = "0.1.0"
+description = "pyarrow.acero connector for VGI (Vector Gateway Interface) — scan VGI catalog tables and call VGI functions from Acero, no DuckDB required"
+readme = "README.md"
+keywords = [
+    "acero",
+    "apache-arrow",
+    "arrow",
+    "pyarrow",
+    "vgi",
+    "data-engineering",
+    "analytics",
+]
+license = { file = "LICENSE" }
+authors = [{ name = "Rusty Conover", email = "rusty@query.farm" }]
+maintainers = [{ name = "Query Farm LLC", email = "hello@query.farm" }]
+classifiers = [
+    "License :: Other/Proprietary License",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+requires-python = ">=3.13"
+dependencies = [
+    # 18.0.0, not lower: pyarrow.acero's Declaration/ScanNodeOptions/
+    # InMemoryDataset(reader, schema=...)/union-node surface this adapter
+    # depends on was already stable well before this floor; matches
+    # vgi-polars' own floor (17.0.0 ships no cp313 wheel at all, which this
+    # package's requires-python = ">=3.13" needs regardless of acero).
+    "pyarrow>=18",
+    # 0.31.0, not 0.30.0: Client.bind() (schema discovery without executing)
+    # and Client.table_function(join_keys=..., ...) (semi-join pushdown) are
+    # both new in this release — vgi_acero's catalog-mode and join-pushdown
+    # paths depend on them directly.
+    "vgi-python>=0.31.0",
+]
+
+[project.optional-dependencies]
+http = ["vgi-python[http]"]
+
+[project.urls]
+Homepage = "https://github.com/Query-farm/vgi-acero"
+Repository = "https://github.com/Query-farm/vgi-acero"
+Issues = "https://github.com/Query-farm/vgi-acero/issues"
+"VGI Protocol" = "https://github.com/Query-farm/vgi-python"
+
+[dependency-groups]
+# Includes the `http` extra so `uv sync` (no --extra needed) can run the
+# HTTP-transport tests locally — vgi.client.Client's HTTP path imports
+# vgi_rpc.http, which needs falcon (only pulled in via vgi-python[http]).
+#
+# pydoclint is intentionally NOT here, matching vgi-python's/vgi-polars' own
+# pyproject.toml comment: it pulls docstring-parser-fork, which can clobber
+# the canonical docstring-parser in the shared `docstring_parser` namespace.
+# Run it isolated via `uvx pydoclint --config pyproject.toml src/` instead.
+dev = [
+    "mypy",
+    "pyarrow-stubs",
+    "pytest>=8.0",
+    "pytest-cov>=7.1.0",
+    "ruff",
+    "vgi-acero[http]",
+]
+
+# Local sibling checkout, not (yet) the published PyPI release — vgi-acero
+# tracks vgi-python's client-side surface as it develops, the same way
+# vgi-polars does. This means a `../vgi-python` checkout must exist next to
+# this repo for `uv sync` to work (see CLAUDE.md's Build/Test section) — CI
+# reproduces the same layout by checking out both repos as siblings.
+[tool.uv.sources]
+vgi-python = { path = "../vgi-python", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vgi_acero"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# Adopted from vgi-python's/vgi-polars' own pyproject.toml (same rule set,
+# same pydocstyle convention, same formatter settings) — this repo tracks
+# vgi-python's client-side surface closely enough that its own lint/type/
+# docstring bar is the right one to hold vgi-acero to as well.
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "D"]
+
+# Test functions/fixtures aren't documented the way public src/ API is —
+# a blanket per-file-ignore here matches vgi-python's/vgi-polars' own
+# per-file `# ruff: noqa:` convention, less repetitive across many test files.
+# D100/D103 = missing module/function docstring, D101/D102 = missing class/method docstring.
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D100", "D101", "D102", "D103"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pydoclint]
+# Docstring consistency gate (complements ruff's `D` rules, which only check
+# docstring *shape*, not whether documented args/attributes match the code).
+# NOT a project dependency (see the `dev` group comment above) — run isolated:
+#   uvx pydoclint --config pyproject.toml src/
+style = "google"
+# We keep types in signatures, not docstrings (Google style) — so don't ask
+# for them in docstrings, and don't try to match return/yield *types* against
+# prose.
+arg_type_hints_in_docstring = false
+check_return_types = false
+check_yield_types = false
+check_class_attributes = true
+# Raises (DOC5xx) are intentionally not gated, matching vgi-python/vgi-polars:
+# docstrings describe exceptions in prose, not a formal `Raises:` section
+# pydoclint can cross-check against actual `raise` statements.
+skip_checking_raises = true
+# Document constructor params in the class docstring, not __init__.
+allow_init_docstring = true
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true

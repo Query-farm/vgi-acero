@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      vgi_python_ref:
+        description: >-
+          git ref (tag/branch/sha) of Query-farm/vgi-python to test against.
+          Defaults to the pinned tag below when left blank.
+        required: false
+        default: ""
+
+# vgi-acero depends on vgi-python via a LOCAL SIBLING checkout
+# ([tool.uv.sources] in pyproject.toml, path = "../vgi-python"), not the
+# published PyPI release — mirrors vgi-polars' own CI (the closest analog in
+# this family). CI checks out BOTH repos as siblings under the same workspace
+# root, mirroring local dev's ~/Development/vgi-acero + ~/Development/vgi-python
+# layout.
+#
+# Pinned (not `main`) so a protocol/fixture change landing on vgi-python's
+# main doesn't silently flip this repo's CI red with no change on this side.
+# Bump VGI_PYTHON_REF in lockstep with real vgi-python API usage changes here;
+# override per-run via the workflow_dispatch input.
+env:
+  VGI_PYTHON_REF: v0.31.0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+      - run: uvx ruff format --check src/ tests/ examples/
+      - run: uvx ruff check src/ tests/ examples/
+
+  build:
+    name: Build & validate package metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+      # Builds against the plain `vgi-python>=...` dependency bound in
+      # pyproject.toml (PyPI), not the [tool.uv.sources] sibling-checkout dev
+      # override — proves the package a real release would publish actually
+      # builds and has valid metadata, on every push/PR, not just at release
+      # time.
+      - name: Build (sdist + wheel)
+        run: uv build --sdist --wheel --out-dir dist .
+      - name: Validate metadata
+        run: uvx twine check dist/*
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout vgi-acero
+        uses: actions/checkout@v7
+        with:
+          path: vgi-acero
+
+      - name: Checkout vgi-python (sibling)
+        uses: actions/checkout@v7
+        with:
+          repository: Query-farm/vgi-python
+          ref: ${{ github.event.inputs.vgi_python_ref || env.VGI_PYTHON_REF }}
+          path: vgi-python
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      # --extra http: falcon/waitress, needed for vgi-fixture-http to serve.
+      - name: Sync vgi-python
+        working-directory: vgi-python
+        run: uv sync --extra http
+
+      - name: Sync vgi-acero
+        working-directory: vgi-acero
+        run: uv sync
+
+      # Needs the full sibling-checkout environment (vgi-python's types, not
+      # just vgi-acero's own code) to resolve imports, so it lives in this job
+      # rather than `lint`.
+      - name: Type check (mypy)
+        working-directory: vgi-acero
+        run: uv run mypy src/
+
+      - name: Run tests
+        working-directory: vgi-acero
+        env:
+          VGI_PYTHON: ${{ github.workspace }}/vgi-python
+        run: uv run pytest -v --cov=vgi_acero --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-xml
+          path: vgi-acero/coverage.xml
+
+  test-min-versions:
+    name: Test against declared minimum dependency versions
+    runs-on: ubuntu-latest
+    # `uv sync` (the `test` job above) always resolves to the NEWEST version
+    # satisfying each dependency constraint, never the oldest -- so a declared
+    # floor like "pyarrow>=18" is never actually exercised at 18 by that job
+    # alone. `--resolution lowest-direct` closes that gap: install this
+    # package (+ its `http` extra) resolving every DIRECT dependency to its
+    # lowest allowed version, then run the real test suite against that
+    # environment.
+    steps:
+      - name: Checkout vgi-acero
+        uses: actions/checkout@v7
+        with:
+          path: vgi-acero
+
+      - name: Checkout vgi-python (sibling)
+        uses: actions/checkout@v7
+        with:
+          repository: Query-farm/vgi-python
+          ref: ${{ github.event.inputs.vgi_python_ref || env.VGI_PYTHON_REF }}
+          path: vgi-python
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      - name: Sync vgi-python
+        working-directory: vgi-python
+        run: uv sync --extra http
+
+      # A plain `uv venv` + `uv pip install -e .[http]`, NOT `uv sync`: the
+      # project's `dev` dependency group (mypy/ruff/pytest/...) has no lower
+      # bounds at all -- it's tooling, never something an end user installs
+      # via `pip install vgi-acero` -- so resolving IT to "lowest" would pick
+      # genuinely ancient/broken releases. Scoping to `-e .[http]` (the
+      # package's own install requirements) is what makes "lowest-direct"
+      # mean "the floor we actually publish."
+      - name: Create minimum-versions venv
+        working-directory: vgi-acero
+        run: uv venv .venv-min --python 3.13
+
+      - name: Install vgi-acero at its declared minimum versions
+        working-directory: vgi-acero
+        run: uv pip install --python .venv-min/bin/python --resolution lowest-direct -e ".[http]"
+
+      - name: Install test tooling (unbounded is fine -- not part of the published floor)
+        working-directory: vgi-acero
+        run: uv pip install --python .venv-min/bin/python pytest pytest-cov
+
+      - name: Run tests against the minimum-versions environment
+        working-directory: vgi-acero
+        env:
+          VGI_PYTHON: ${{ github.workspace }}/vgi-python
+        run: .venv-min/bin/python -m pytest -v
