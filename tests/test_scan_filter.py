@@ -90,6 +90,27 @@ def test_catalog_table_scan_composes_with_local_acero_filter(catalog: Any) -> No
     assert sorted(table.column("n").to_pylist()) == [3, 4, 5, 6]
 
 
+def test_required_filters_enforced_on_the_ordinary_vgi_path(catalog: Any) -> None:
+    """Regression: required_filters was only enforced for natively-delegated scans, never the ordinary VGI path."""
+    from vgi_acero.errors import VgiAceroError
+
+    table_handle = catalog.table("data", "rff_simple")
+    assert table_handle.required_filters() == [["a"]]
+
+    try:
+        table_handle.scan()
+        raise AssertionError("expected VgiAceroError for an unfiltered required_filters scan")
+    except VgiAceroError:
+        pass
+
+    # A filter (even one the table can't actually push down here) satisfies
+    # the "did you even try" gate.
+    table_handle.scan(filter=ds.field("a") == 1).to_table()
+
+    # The explicit escape hatch always works too.
+    table_handle.scan(acknowledge_required_filters=True).to_table()
+
+
 def _translate(client: Any, expr: Any) -> bytes | None:
     """Resolve `filter_echo`'s schema via `Client.bind()` and translate `expr` against it."""
     from vgi_acero._filter_translate import translate_predicate

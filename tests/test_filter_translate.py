@@ -80,6 +80,26 @@ class TestIn:
         assert specs[0]["type"] == "in"
         assert specs[0]["column_name"] == "n"
 
+    def test_string_value_containing_a_literal_comma(self) -> None:
+        """Regression: a naive split(",") on the value list tears a comma-containing string apart."""
+        specs = _decode(translate_predicate(ds.field("s").isin(["foo,bar", "baz"]), SCHEMA))
+        assert len(specs) == 1
+        assert specs[0]["type"] == "in"
+
+    def test_large_list_beyond_pyarrows_pretty_print_truncation_declines_gracefully(self) -> None:
+        """Regression: pyarrow truncates a long is_in() list with a bare literal "..." line.
+
+        Confirmed live (pyarrow 25.0.1): ast.literal_eval chokes on it. This
+        must decline the conjunct, never raise out of translate_predicate.
+        """
+        big_list = list(range(50))
+        assert translate_predicate(ds.field("n").isin(big_list), SCHEMA) is None
+        # Same, but as one conjunct of an AND chain -- the translatable sibling must still push.
+        expr = (ds.field("n") >= 3) & ds.field("n").isin(big_list)
+        specs = _decode(translate_predicate(expr, SCHEMA))
+        assert len(specs) == 1
+        assert specs[0]["op"] == "ge"
+
     def test_non_default_null_matching_behavior_is_declined(self) -> None:
         # `null_matching_behavior=MATCH` is the only value this module
         # translates — this test is the regression guard for that decision
@@ -162,6 +182,24 @@ class TestUnsupported:
         import pyarrow.compute as pc
 
         expr = (ds.field("n") >= 3) & (pc.field("s").cast(pa.int64()) > pc.field("n"))
+        specs = _decode(translate_predicate(expr, SCHEMA))
+        assert len(specs) == 1
+        assert specs[0]["op"] == "ge"
+
+    def test_options_bearing_call_wrapping_another_calls_result_does_not_poison_siblings(self) -> None:
+        """Regression: an options-bearing function applied to a NESTED call's result.
+
+        `match_substring(binary_join_element_wise(a, b, "-"), "foo")` has a
+        parenthesized function call inside its own argument list, ahead of
+        its `{...}` options block -- _OPAQUE_OPTIONS_CALL_RE must still
+        recognize and shield it (one level of nesting), or its unrewritten
+        `{...}` block breaks ast.parse for the whole expression, silently
+        dropping the perfectly-translatable `n >= 3` sibling too.
+        """
+        import pyarrow.compute as pc
+
+        nested = pc.match_substring(pc.binary_join_element_wise(ds.field("s"), ds.field("s"), "-"), "foo")
+        expr = (ds.field("n") >= 3) & nested
         specs = _decode(translate_predicate(expr, SCHEMA))
         assert len(specs) == 1
         assert specs[0]["op"] == "ge"

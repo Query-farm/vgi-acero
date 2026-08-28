@@ -90,16 +90,26 @@ _ISNULL_OPTS_RE = re.compile(r"is_null\((\w+),\s*\{[^}]*\}\)")
 # Matches: FieldRef.Nested(FieldRef.Name(parent) FieldRef.Name(child)) -> a placeholder
 _NESTED_FIELD_RE = re.compile(r"FieldRef\.Nested\(FieldRef\.Name\((\w+)\)\s+FieldRef\.Name\((\w+)\)\)")
 # Catches any options-bearing call this module doesn't specifically handle
-# (e.g. cast(s, {to_type=int64, ...})) — run LAST, after the specific
-# is_in/is_null/starts_with-etc. rewrites above have already consumed their
-# own matches. Anything still matching this becomes an opaque placeholder:
-# valid-Python (so it doesn't break ast.parse for the REST of the expression,
-# including sibling AND-conjuncts that have nothing to do with it), but
-# immediately untranslatable wherever it's referenced. Without this, one
-# conjunct containing a truly unmapped options-bearing function would raise
+# (e.g. cast(s, {to_type=int64, ...}), or an unmapped function wrapping
+# ANOTHER call's result, e.g. match_substring(binary_join_element_wise(a, b,
+# "-"), "foo")) — run LAST, after the specific is_in/is_null/starts_with-etc.
+# rewrites above have already consumed their own matches. Anything still
+# matching this becomes an opaque placeholder: valid-Python (so it doesn't
+# break ast.parse for the REST of the expression, including sibling
+# AND-conjuncts that have nothing to do with it), but immediately
+# untranslatable wherever it's referenced. Without this, one conjunct
+# containing a truly unmapped options-bearing function would raise
 # SyntaxError for the entire top-level ast.parse, silently dropping pushdown
 # for every OTHER, perfectly translatable, sibling conjunct too.
-_OPAQUE_OPTIONS_CALL_RE = re.compile(r"\w+\([^{}()]*,\s*\{[^{}]*\}\)")
+#
+# The `(?:[^{}()]|\([^{}()]*\))*` alternation tolerates ONE level of nested
+# parens in the argument list before the options block -- e.g. the
+# binary_join_element_wise(...) example above -- but not two (a call nested
+# two calls deep still isn't recognized and falls through to a raw
+# SyntaxError). That's a real, bounded limit, not full generality; a doubly-
+# nested shape is rare enough in a filter predicate that a manual
+# paren-depth scanner wasn't judged worth the complexity here.
+_OPAQUE_OPTIONS_CALL_RE = re.compile(r"\w+\((?:[^{}()]|\([^{}()]*\))*,\s*\{[^{}]*\}\)")
 
 # pyarrow's default is_in() null-matching behavior — the only value worker-side
 # InFilter.evaluate (bare pc.is_in(col, vals), no options) matches exactly.
@@ -185,7 +195,22 @@ def _preprocess(
     def isin_repl(m: re.Match[str]) -> str:
         nonlocal counter
         col, type_name, items_text, null_matching = m.group(1), m.group(2), m.group(3), m.group(4)
-        items = [ast.literal_eval(tok.strip()) for tok in items_text.split(",") if tok.strip()]
+        # A single ast.literal_eval over the whole bracketed list (not a naive
+        # split(",") + per-token literal_eval) so a string value containing a
+        # literal comma parses correctly instead of being torn apart at the
+        # wrong boundary. This also fails closed (via the except below) for
+        # pyarrow's own truncated-list pretty-printing (lists beyond ~20 items
+        # render with a literal bare "..." line, which is not valid Python and
+        # raises SyntaxError here) -- confirmed live against pyarrow 25.0.1.
+        try:
+            items = ast.literal_eval(f"[{items_text}]")
+        except (SyntaxError, ValueError):
+            # Decline this occurrence rather than crash translate_predicate
+            # entirely: leave the text unchanged so _OPAQUE_OPTIONS_CALL_RE
+            # (run after this substitution) catches it as an untranslatable
+            # placeholder instead -- this conjunct is dropped, siblings still
+            # translate.
+            return m.group(0)
         name = f"__isin_{counter}__"
         counter += 1
         isin_placeholders[name] = (col, type_name, items, null_matching)
@@ -237,6 +262,18 @@ def _walk(
     """
     if isinstance(node, ast.BoolOp):
         children = [_walk(v, schema, isin_ph, nested_ph, opaque_ph, values) for v in node.values]
+        # KNOWN LIMITATION: the wire format's AndFilter/OrFilter ties one
+        # column_name/column_index to the whole node (inherited from the
+        # shared Filter base type) -- there's no multi-column node shape to
+        # pick instead. Anchoring on the first child's column is a real
+        # optimization-quality gap for a group spanning more than one column
+        # (e.g. inside an OR: `(x>5) | (y<3 & z>1)`): worker-side helpers that
+        # index pushed filters by column (PushdownFilters._collect_column_filters)
+        # only descend into this node when queried for THIS column, so a
+        # non-anchor column's constraint is invisible to those helpers even
+        # though evaluate() (the actual row-filtering path) is unaffected and
+        # stays correct. Fixing this for real would need a wire-protocol
+        # change (a genuinely multi-column AND/OR shape), out of scope here.
         anchor = children[0]["column_name"]
         kind = "and" if isinstance(node.op, ast.And) else "or"
         return {

@@ -26,9 +26,12 @@ def test_split_scan_reproduces_whole_scan(worker_location: str) -> None:
         c.start()
         return c
 
-    decl = vgi_scan_splits(client_factory, schema_name=MAIN, function_name="split_sequence", arguments=args)
-    table = decl.to_table()
-    assert sorted(table.column("n").to_pylist()) == list(range(37))
+    result = vgi_scan_splits(client_factory, schema_name=MAIN, function_name="split_sequence", arguments=args)
+    try:
+        table = result.declaration.to_table()
+        assert sorted(table.column("n").to_pylist()) == list(range(37))
+    finally:
+        result.close()
 
 
 def test_zero_splits_yields_empty_result(worker_location: str) -> None:
@@ -39,6 +42,26 @@ def test_zero_splits_yields_empty_result(worker_location: str) -> None:
         c.start()
         return c
 
-    decl = vgi_scan_splits(client_factory, schema_name=MAIN, function_name="split_zero", arguments=args)
-    table = decl.to_table()
-    assert table.num_rows == 0
+    result = vgi_scan_splits(client_factory, schema_name=MAIN, function_name="split_zero", arguments=args)
+    try:
+        table = result.declaration.to_table()
+        assert table.num_rows == 0
+        # split_zero produces zero splits -- nothing for the caller to close.
+        assert result.clients == []
+    finally:
+        result.close()
+
+
+def test_split_scan_closes_all_clients_it_opened(worker_location: str) -> None:
+    """Every per-split Client SplitScanResult reports must actually stop cleanly."""
+    args = Arguments(named={"n": pa.scalar(20), "splits": pa.scalar(4)})
+
+    def client_factory() -> Client:
+        c = Client(worker_location)
+        c.start()
+        return c
+
+    result = vgi_scan_splits(client_factory, schema_name=MAIN, function_name="split_sequence", arguments=args)
+    result.declaration.to_table()
+    assert len(result.clients) == 4
+    result.close()  # must not raise

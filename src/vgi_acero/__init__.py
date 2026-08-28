@@ -11,6 +11,8 @@ Public entry points:
     VgiAceroTable             -- a lazy handle to one catalog table
     vgi_scan(...)             -- scan a bare (non-catalog) table function
     vgi_scan_splits(...)      -- split-planned, concurrently-pulled parallel scan
+                                 (returns a SplitScanResult -- close() it when done)
+    SplitScanResult           -- the .declaration + .clients pair vgi_scan_splits() returns
     vgi_semi_join_scan(...)   -- push build-side join keys down to a probe-side scan
     vgi_topn_scan(...)        -- adaptive Top-N re-query (see _topn.py for why)
     make_vgi_scan_declaration(...) -- wrap a raw VGI batch generator as a Declaration
@@ -20,13 +22,14 @@ Public entry points:
 from __future__ import annotations
 
 from vgi_acero._join import vgi_semi_join_scan
-from vgi_acero._scan import make_vgi_scan_declaration, vgi_scan, vgi_scan_splits
+from vgi_acero._scan import SplitScanResult, make_vgi_scan_declaration, vgi_scan, vgi_scan_splits
 from vgi_acero._topn import vgi_topn_scan
 from vgi_acero.catalog import VgiAceroCatalog, attach
 from vgi_acero.errors import VgiAceroError
 from vgi_acero.table import VgiAceroTable
 
 __all__ = [
+    "SplitScanResult",
     "VgiAceroCatalog",
     "VgiAceroError",
     "VgiAceroTable",

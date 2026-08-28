@@ -55,14 +55,17 @@ def main() -> None:
             c.start()
             return c
 
-        splits = vgi_scan_splits(
+        split_result = vgi_scan_splits(
             client_factory,
             schema_name="main",
             function_name="split_sequence",
             arguments=Arguments(named={"n": pa.scalar(30), "splits": pa.scalar(4)}),
         )
-        print("\nsplit-planned union scan:")
-        print(ac.Declaration.from_sequence([splits]).to_table())
+        try:
+            print("\nsplit-planned union scan:")
+            print(ac.Declaration.from_sequence([split_result.declaration]).to_table())
+        finally:
+            split_result.close()  # stop every per-split Client vgi_scan_splits() opened
 
         # 3. Semi-join key pushdown, composed with a real HashJoinNodeOptions.
         build_table = pa.table({"n": pa.array([5, 10, 90], type=pa.int64())})

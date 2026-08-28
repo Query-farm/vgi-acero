@@ -28,6 +28,7 @@ from it. Prefer that path whenever a catalog attach is available.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
@@ -39,7 +40,40 @@ if TYPE_CHECKING:
     from vgi.arguments import Arguments
     from vgi.client.client import Client
 
-__all__ = ["make_vgi_scan_declaration", "vgi_scan", "vgi_scan_splits"]
+__all__ = ["SplitScanResult", "make_vgi_scan_declaration", "vgi_scan", "vgi_scan_splits"]
+
+
+@dataclass
+class SplitScanResult:
+    """Result of `vgi_scan_splits()`: a plan plus the `Client`s it opened.
+
+    `vgi_scan_splits()` creates one `Client` per split internally (via the
+    caller's `client_factory`) — unlike `vgi_scan()`, where the caller
+    already holds the one `Client` involved, there is no way for the caller
+    to reach these otherwise. `Client` has no `__del__`/`atexit` cleanup, so
+    without this, every split's subprocess worker would be silently orphaned
+    for the life of the process. Call `close()` (or stop each of `clients`
+    yourself) once you're done running `declaration`'s plan to completion —
+    never before, per `make_vgi_scan_declaration`'s "must be executed"
+    caveat, which applies to every one of these clients' open generators.
+
+    Attributes:
+        declaration: The `ac.Declaration("union", ...)` (or, for a
+            zero-split result, a `table_source` over an empty table).
+        clients: Every per-split `Client` this call created and started.
+            Empty for a zero-split result — that branch's own internal
+            `Client` (used only for unary `bind()`/`table_function_plan()`
+            calls, never an open stream) is stopped before `vgi_scan_splits`
+            returns, so there is nothing left for the caller to close.
+    """
+
+    declaration: ac.Declaration
+    clients: list[Client]
+
+    def close(self) -> None:
+        """Stop every `Client` this result holds. Safe to call once you're done with `declaration`."""
+        for client in self.clients:
+            client.stop()
 
 
 def make_vgi_scan_declaration(gen: Iterator[pa.RecordBatch]) -> ac.Declaration:
@@ -145,8 +179,9 @@ def vgi_scan_splits(
     arguments: Arguments | None = None,
     projection_ids: list[int] | None = None,
     pushdown_filters: bytes | None = None,
+    join_keys: list[pa.RecordBatch] | None = None,
     settings: dict[str, Any] | None = None,
-) -> ac.Declaration:
+) -> SplitScanResult:
     """Scan a split-capable VGI table function as a unioned, concurrently-pulled Acero plan.
 
     Unlike vgi-polars' equivalent (sequential split chaining — Polars'
@@ -159,11 +194,18 @@ def vgi_scan_splits(
     Each split gets its **own** `Client` (from `client_factory`, e.g.
     `VgiAceroCatalog._exchange_client`), never a shared one — `Client` is not
     thread-safe for concurrent exchange-mode calls, and Acero may pull from
-    several `union` inputs concurrently.
+    several `union` inputs concurrently. Unlike `vgi_scan()` (where the
+    caller already holds the one `Client` involved), this function creates
+    all of these itself, so the returned `SplitScanResult` carries them —
+    call `.close()` once you're done executing `.declaration`'s plan. A
+    partial failure while building split declarations (a later split's bind
+    fails, a subprocess spawn errors) stops every split `Client` already
+    opened before re-raising, rather than leaving them orphaned.
 
     Args:
         client_factory: Returns a fresh, already-started `Client` each call.
-            One is created per split.
+            One is created per split (plus one short-lived one for the
+            planning call itself, stopped before this function returns).
         schema_name: The catalog schema declaring `function_name`.
         function_name: The split-capable table function to scan (check
             `FunctionInfo.supports_splits` first — a worker that doesn't opt
@@ -174,62 +216,86 @@ def vgi_scan_splits(
         projection_ids: Column indices to project, or `None` for all columns.
         pushdown_filters: Serialized filter-pushdown IPC bytes, same as
             `vgi_scan`'s.
+        join_keys: Serialized join-key batches for semi-join pushdown, same
+            as `vgi_scan`'s — threaded into both the planning call and every
+            split's redemption.
         settings: Optional dictionary of settings/pragmas.
 
     Returns:
-        An `ac.Declaration("union", ...)` over one scan `Declaration` per
-        split. See `make_vgi_scan_declaration`'s "must be executed" caveat —
-        it applies to every split scan this builds.
+        A `SplitScanResult` — `.declaration` is an `ac.Declaration("union",
+        ...)` over one scan `Declaration` per split (see
+        `make_vgi_scan_declaration`'s "must be executed" caveat, which
+        applies to every split scan this builds); `.clients` is every
+        `Client` you must `.close()` once that plan has run to completion.
 
     """
     plan_client = client_factory()
-    plan = plan_client.table_function_plan(
-        function_name=function_name,
-        schema_name=schema_name,
-        arguments=arguments,
-        projection_ids=projection_ids,
-        pushdown_filters=pushdown_filters,
-        settings=settings,
-    )
-
-    def _split_declaration(split: ScanSplit) -> ac.Declaration:
-        split_client = client_factory()
-        gen = split_client.table_function(
+    try:
+        plan = plan_client.table_function_plan(
             function_name=function_name,
             schema_name=schema_name,
             arguments=arguments,
             projection_ids=projection_ids,
             pushdown_filters=pushdown_filters,
+            join_keys=join_keys,
             settings=settings,
-            split_tokens=[split.token],
-            split_execution_id=plan.execution_id,
-            split_init_opaque_data=plan.init_opaque_data,
         )
-        return make_vgi_scan_declaration(gen)
 
-    # Client.table_function_plan() always fully deserializes plan.splits to
-    # ScanSplit objects before returning (see its own docstring/implementation)
-    # — the `list[ScanSplit] | list[bytes]` field type only reflects the wire
-    # shape before that deserialization, so this assert should never fail.
-    splits: list[ScanSplit] = []
-    for split in plan.splits:
-        assert isinstance(split, ScanSplit), f"expected a deserialized ScanSplit, got {type(split)}"
-        splits.append(split)
-    split_decls = [_split_declaration(split) for split in splits]
-    if not split_decls:
-        # No splits is legal (a fully-pruned scan, or a genuinely empty
-        # table) and means an empty result — NOT "fall back to an ordinary
-        # whole-scan": a split-only function (one that implements on_plan()/
-        # on_split() with no primary/secondary path) rejects a non-split
-        # init outright, confirmed live against vgi-fixture-worker's
-        # `split_zero` fixture (`RuntimeError: ... is split-only but was
-        # initialized with no split tokens`). Use Client.bind() (zero
-        # execution) to get the schema for an empty TableSourceNodeOptions
-        # instead.
-        bind_response = plan_client.bind(function_name=function_name, schema_name=schema_name, arguments=arguments)
-        output_schema = bind_response.output_schema
-        if projection_ids is not None:
-            output_schema = pa.schema([output_schema.field(i) for i in projection_ids])
-        return ac.Declaration("table_source", ac.TableSourceNodeOptions(output_schema.empty_table()))
+        # Client.table_function_plan() always fully deserializes plan.splits to
+        # ScanSplit objects before returning (see its own docstring/implementation)
+        # — the `list[ScanSplit] | list[bytes]` field type only reflects the wire
+        # shape before that deserialization, so this assert should never fail.
+        splits: list[ScanSplit] = []
+        for split in plan.splits:
+            assert isinstance(split, ScanSplit), f"expected a deserialized ScanSplit, got {type(split)}"
+            splits.append(split)
 
-    return ac.Declaration("union", ac.ExecNodeOptions(), inputs=split_decls)
+        if not splits:
+            # No splits is legal (a fully-pruned scan, or a genuinely empty
+            # table) and means an empty result — NOT "fall back to an
+            # ordinary whole-scan": a split-only function (one that
+            # implements on_plan()/on_split() with no primary/secondary path)
+            # rejects a non-split init outright, confirmed live against
+            # vgi-fixture-worker's `split_zero` fixture (`RuntimeError: ...
+            # is split-only but was initialized with no split tokens`). Use
+            # Client.bind() (zero execution, and this connection is about to
+            # be stopped anyway) to get the schema for an empty
+            # TableSourceNodeOptions instead.
+            bind_response = plan_client.bind(function_name=function_name, schema_name=schema_name, arguments=arguments)
+            output_schema = bind_response.output_schema
+            if projection_ids is not None:
+                output_schema = pa.schema([output_schema.field(i) for i in projection_ids])
+            empty_decl = ac.Declaration("table_source", ac.TableSourceNodeOptions(output_schema.empty_table()))
+            return SplitScanResult(declaration=empty_decl, clients=[])
+    finally:
+        # Only ever used for unary bind()/table_function_plan() calls above —
+        # no open stream, so it's always safe to stop here regardless of
+        # which branch returns.
+        plan_client.stop()
+
+    split_clients: list[Client] = []
+    try:
+        split_decls = []
+        for split in splits:
+            split_client = client_factory()
+            split_clients.append(split_client)
+            gen = split_client.table_function(
+                function_name=function_name,
+                schema_name=schema_name,
+                arguments=arguments,
+                projection_ids=projection_ids,
+                pushdown_filters=pushdown_filters,
+                join_keys=join_keys,
+                settings=settings,
+                split_tokens=[split.token],
+                split_execution_id=plan.execution_id,
+                split_init_opaque_data=plan.init_opaque_data,
+            )
+            split_decls.append(make_vgi_scan_declaration(gen))
+    except BaseException:
+        for split_client in split_clients:
+            split_client.stop()
+        raise
+
+    union_decl = ac.Declaration("union", ac.ExecNodeOptions(), inputs=split_decls)
+    return SplitScanResult(declaration=union_decl, clients=split_clients)

@@ -321,6 +321,22 @@ class VgiAceroTable:
         unchanged single-scan path with no multi-branch overhead beyond one
         extra (cheap, memoized, unary) `table_scan_branches_get` catalog call.
 
+        **Required-filters cost safety** (`TableInfo.required_filters` — an
+        AND-of-OR-groups of column names a scan predicate must reference at
+        least one of, per group): enforced here for BOTH the native and the
+        ordinary VGI-hosted path, before either ever runs — a table
+        declaring this and given no `filter` at all raises `VgiAceroError`
+        unless `acknowledge_required_filters=True`. This does not verify a
+        *given* filter actually references the required columns (that would
+        need real expression introspection this module doesn't attempt) —
+        only "some predicate was supplied" — so it catches the common
+        "forgot to filter at all" mistake, not a filter that references the
+        wrong columns. Without this, a natively-delegated scan (see below)
+        would trigger a full, possibly enormous, unfiltered remote read with
+        no hook to catch it after the fact — and the ordinary VGI path had
+        the exact same gap for a plain `filter=None` call before this check
+        existed here.
+
         **Native scan-function delegation** (`_native_scan.py`): when the
         resolved scan function names something Acero can satisfy directly
         (currently `read_parquet`/`read_csv` -> `ds.dataset(...)`) rather than
@@ -329,12 +345,18 @@ class VgiAceroTable:
         are not yet threaded into the native path (`ac.ScanNodeOptions`
         itself accepts `columns=`/`filter=` scan-level pushdown — wiring
         those through is a natural follow-up, not done here; see
-        `_native_scan.py`'s module docstring). If the table also
-        declares `required_filters`, this raises `VgiAceroError` unless
-        `acknowledge_required_filters=True` — there's no hook to inspect the
-        eventual predicate before execution for a natively-delegated scan, so
-        refusing by default beats silently dropping a real safety guard.
+        `_native_scan.py`'s module docstring).
         """
+        required = self.required_filters()
+        if required and filter is None and not acknowledge_required_filters:
+            raise VgiAceroError(
+                f"{self.schema_name}.{self.name}: declares required_filters {required} — "
+                "scanning with no filter at all is refused by default. Pass a `filter=` that "
+                "satisfies it, or scan(acknowledge_required_filters=True) once you've applied "
+                "the equivalent filter yourself, or you WILL trigger a full, possibly enormous, "
+                "unfiltered remote read."
+            )
+
         branches = self._scan_branches_get()
         if len(branches) != 1:
             return self.scan_all_branches()
@@ -344,16 +366,6 @@ class VgiAceroTable:
         scan_fn = self._scan_function_get()
         native_handler = NATIVE_SCAN_HANDLERS.get(scan_fn.function_name)
         if native_handler is not None:
-            required = self.required_filters()
-            if required and not acknowledge_required_filters:
-                raise VgiAceroError(
-                    f"{self.schema_name}.{self.name}: natively delegates to "
-                    f"{scan_fn.function_name!r} and declares required_filters {required} that "
-                    "vgi-acero cannot enforce for a native scan (no hook to inspect the eventual "
-                    "predicate before execution). Pass scan(acknowledge_required_filters=True) "
-                    "once you've applied the equivalent filter(s) yourself, or you WILL trigger a "
-                    "full, possibly enormous, unfiltered remote read."
-                )
             return native_handler(scan_fn, schema_name=self.schema_name, table_name=self.name)
 
         return self._scan_one(
