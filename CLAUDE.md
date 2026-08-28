@@ -42,7 +42,7 @@ override with `VGI_TEST_WORKER=<command>` or `VGI_PYTHON=<path to vgi-python che
 - `catalog.py` — `VgiAceroCatalog` + `attach()`. One shared `Client` for
   catalog-metadata RPCs (`schemas`, `table_get`, `schema_contents`,
   `table_scan_function_get`, `bind`, ...); one **per-thread** `Client` (via
-  `_exchange_client()`) for exchange-mode RPCs (`table_function`,
+  `exchange_client()`) for exchange-mode RPCs (`table_function`,
   `scalar_function`). See its module docstring's "Thread safety" section —
   `vgi.client.Client` is not safe for concurrent exchange-mode use on one
   shared instance (confirmed by direct stress test), and Acero's own default

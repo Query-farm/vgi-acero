@@ -32,7 +32,7 @@ from vgi.catalog.catalog_interface import (
 
 from vgi_acero._filter_translate import translate_predicate
 from vgi_acero._scan import make_vgi_scan_declaration
-from vgi_acero.errors import VGI_CLIENT_ERRORS, VgiAceroError
+from vgi_acero.errors import VGI_CLIENT_ERRORS, VgiAceroError, wrap_error
 
 if TYPE_CHECKING:
     from vgi.catalog.catalog_interface import ScanBranch
@@ -138,7 +138,7 @@ class VgiAceroTable:
     def _table_get(self) -> TableInfo:
         if self._table_info is None:
             try:
-                info = self._catalog.client.table_get(
+                info = self._catalog.metadata_client.table_get(
                     attach_opaque_data=self._catalog.attach_opaque_data,
                     schema_name=self.schema_name,
                     name=self.name,
@@ -146,7 +146,7 @@ class VgiAceroTable:
                     at_value=self.at_value,
                 )
             except VGI_CLIENT_ERRORS as e:
-                raise VgiAceroError(str(e)) from e
+                raise wrap_error(e) from e
             if info is None:
                 raise VgiAceroError(f"table not found: {self.schema_name}.{self.name}")
             self._table_info = info
@@ -155,7 +155,7 @@ class VgiAceroTable:
     def _scan_function_get(self) -> ScanFunctionResult:
         if self._scan_function is None:
             try:
-                self._scan_function = self._catalog.client.table_scan_function_get(
+                self._scan_function = self._catalog.metadata_client.table_scan_function_get(
                     attach_opaque_data=self._catalog.attach_opaque_data,
                     schema_name=self.schema_name,
                     name=self.name,
@@ -163,12 +163,12 @@ class VgiAceroTable:
                     at_value=self.at_value,
                 )
             except VGI_CLIENT_ERRORS as e:
-                raise VgiAceroError(str(e)) from e
+                raise wrap_error(e) from e
         return self._scan_function
 
     def _lookup_table_function(self, schema_name: str, function_name: str) -> FunctionInfo | None:
         try:
-            infos = self._catalog.client.schema_contents(
+            infos = self._catalog.metadata_client.schema_contents(
                 attach_opaque_data=self._catalog.attach_opaque_data,
                 name=schema_name,
                 type=SchemaObjectType.TABLE_FUNCTION,
@@ -245,7 +245,7 @@ class VgiAceroTable:
         """
         if self._scan_branches is None:
             try:
-                result = self._catalog.client.table_scan_branches_get(
+                result = self._catalog.metadata_client.table_scan_branches_get(
                     attach_opaque_data=self._catalog.attach_opaque_data,
                     schema_name=self.schema_name,
                     name=self.name,
@@ -253,7 +253,7 @@ class VgiAceroTable:
                     at_value=self.at_value,
                 )
             except VGI_CLIENT_ERRORS as e:
-                raise VgiAceroError(str(e)) from e
+                raise wrap_error(e) from e
             self._scan_branches = list(result.branches)
         return self._scan_branches
 
@@ -275,13 +275,28 @@ class VgiAceroTable:
         what got pushed, since VGI pushdown is only ever an optimization.
         """
         full_schema = self.arrow_schema
+
+        if columns is not None:
+            # pyarrow.Schema.get_field_index() returns -1 (not a KeyError) for
+            # an unknown name -- confirmed live: an unvalidated -1 silently
+            # resolves via Python negative indexing to the LAST column
+            # instead of raising, so a typo'd column name returned a real,
+            # wrong-column, non-empty table with no exception at all. Reject
+            # up front instead.
+            unknown = [c for c in columns if c not in full_schema.names]
+            if unknown:
+                raise VgiAceroError(
+                    f"{self.schema_name}.{self.name}: column(s) {unknown} not in schema {full_schema.names}"
+                )
+
         projection_ids = None
         pushdown_bytes = None
         can_project = function_info is not None and function_info.projection_pushdown
         can_filter = function_info is not None and function_info.filter_pushdown
 
-        if columns is not None and can_project:
-            projection_ids = [full_schema.get_field_index(c) for c in columns]
+        pushed_projection = columns is not None and can_project
+        if pushed_projection:
+            projection_ids = [full_schema.get_field_index(c) for c in columns]  # type: ignore[union-attr]
         if filter is not None and can_filter and projection_ids is None:
             # Gate the bounded `expression`-type fallback on the worker
             # having declared it can evaluate at least one expression-filter
@@ -295,7 +310,7 @@ class VgiAceroTable:
                 filter, full_schema, allow_expression_fallback=allow_expression_fallback
             )
 
-        gen = self._catalog._exchange_client().table_function(
+        gen = self._catalog.exchange_client().table_function(
             function_name=function_name,
             schema_name=function_schema,
             projection_ids=projection_ids,
@@ -304,6 +319,13 @@ class VgiAceroTable:
         decl = make_vgi_scan_declaration(gen)
         if filter is not None:
             decl = ac.Declaration("filter", ac.FilterNodeOptions(filter), inputs=[decl])
+        if columns is not None and not pushed_projection:
+            # The worker couldn't (or wasn't asked to) narrow columns itself
+            # (no projection_pushdown, or the filter-pushdown slot was used
+            # instead -- see the module docstring's "never both at once") --
+            # `columns=` is still honored locally, same "pushdown is only
+            # ever an optimization" posture `filter=` already gets above.
+            decl = ac.Declaration("project", ac.ProjectNodeOptions([pc.field(c) for c in columns]), inputs=[decl])
         return decl
 
     def scan(
@@ -437,22 +459,30 @@ class VgiAceroTable:
         A plain catalog-metadata RPC, no scan.
         """
         try:
-            return self._catalog.client.table_column_statistics(
+            return self._catalog.metadata_client.table_column_statistics(
                 attach_opaque_data=self._catalog.attach_opaque_data,
                 schema_name=self.schema_name,
                 name=self.name,
             )
         except VGI_CLIENT_ERRORS as e:
-            raise VgiAceroError(str(e)) from e
+            raise wrap_error(e) from e
 
     def required_filters(self) -> list[list[str]]:
         """AND-of-OR-groups of column names a scan predicate must reference at least one of, per group.
 
         Purely declarative on the wire (`TableInfo.required_filters`) —
-        `scan()` enforces it (for natively-delegated tables only, see
-        `_native_scan.py`) as a cost-safety guard before scanning.
+        `scan()` enforces it (for both the native and the ordinary VGI-hosted
+        path) as a cost-safety guard before scanning.
         """
         return list(self._table_get().required_filters)
+
+    def __repr__(self) -> str:
+        """A REPL-friendly summary — schema-qualified name plus schema (best-effort; never raises)."""
+        try:
+            names = self.arrow_schema.names
+        except Exception:  # noqa: BLE001 - __repr__ must never raise
+            return f"VgiAceroTable({self.schema_name}.{self.name})"
+        return f"VgiAceroTable({self.schema_name}.{self.name}, columns={names!r})"
 
 
 class _Unresolved:

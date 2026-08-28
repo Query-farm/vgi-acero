@@ -20,7 +20,7 @@ calling `scalar_function` concurrently on one `Client`: 18 corrupted/errored,
 multi-threaded, a registered scalar UDF (`_scalar.py`) can be invoked from
 several worker threads concurrently, and `vgi_scan_splits()` deliberately
 pulls from several split scans concurrently via Acero's `union` node. So every
-exchange-mode call site uses `VgiAceroCatalog._exchange_client()` (one
+exchange-mode call site uses `VgiAceroCatalog.exchange_client()` (one
 lazily-created `Client` per calling thread, all sharing the one
 `attach_opaque_data` from the catalog's single `catalog_attach`), never the
 catalog's single shared `Client` directly. Catalog-metadata methods (`schemas`,
@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self
 from vgi.catalog.catalog_interface import CatalogAttachResult, SchemaObjectType
 from vgi.client.client import Client
 
-from vgi_acero.errors import VGI_CLIENT_ERRORS, VgiAceroError
+from vgi_acero.errors import VGI_CLIENT_ERRORS, VgiAceroError, wrap_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -93,24 +93,41 @@ class VgiAceroCatalog:
         return self._attach_result.default_schema
 
     @property
-    def client(self) -> Client:
+    def metadata_client(self) -> Client:
         """The underlying vgi-python `Client` used for **catalog-metadata** RPCs only.
 
         Covers `schemas`, `table_get`, `schema_contents`,
-        `table_scan_function_get`, `table_column_statistics`, `bind`. Not
-        part of the stable public API. Exchange-mode calls (table/scalar
-        function invocation) must use `_exchange_client()` instead — see the
-        module docstring's "Thread safety" section.
+        `table_scan_function_get`, `table_column_statistics`, `bind`. Exchange-mode
+        calls (table/scalar function invocation) must use `exchange_client()`
+        instead — see the module docstring's "Thread safety" section. Named
+        `metadata_client`, not the bare `client`, specifically so it doesn't
+        read as "the client, use this for anything" next to `exchange_client()`
+        at a REPL's tab-completion list.
+
+        Raises after `detach()` — this is also how `VgiAceroTable`'s own RPC
+        methods (which reach the shared client only via this property, never
+        `self._client` directly) inherit the same guard without each needing
+        its own check: confirmed live, before this guard existed, that
+        calling a table method after `detach()` silently spawned a fresh
+        connection and returned real-looking data instead of failing.
         """
+        self._check_not_detached()
         return self._client
 
-    def _exchange_client(self) -> Client:
+    def exchange_client(self) -> Client:
         """A `Client` safe for the calling thread's exclusive use, for exchange-mode RPCs.
 
-        Lazily creates and starts one per thread via `_client_factory`,
-        reusing it across that thread's subsequent calls; never shared across
-        threads. See the module docstring.
+        Use this (never `metadata_client`) for anything that drives
+        `Client.table_function`/`scalar_function`/`table_in_out_function` —
+        e.g. building a `vgi_scan()`/`vgi_semi_join_scan()` Declaration
+        against a function reached through this catalog's attach, or inside
+        a `pc.register_scalar_function` callback Acero may invoke from
+        multiple threads. Lazily creates and starts one per calling thread
+        via the internal client factory, reusing it across that thread's
+        subsequent calls; never shared across threads. See the module
+        docstring's "Thread safety" section.
         """
+        self._check_not_detached()
         existing: Client | None = getattr(self._thread_local, "client", None)
         if existing is not None:
             return existing
@@ -121,16 +138,22 @@ class VgiAceroCatalog:
             self._exchange_clients.append(new_client)
         return new_client
 
+    def _check_not_detached(self) -> None:
+        if self._detached:
+            raise VgiAceroError(f"catalog {self._name!r} has been detached and can no longer be used")
+
     def schemas(self) -> list[str]:
         """List schema names in this catalog."""
+        self._check_not_detached()
         try:
             infos = self._client.schemas(attach_opaque_data=self.attach_opaque_data)
         except VGI_CLIENT_ERRORS as e:
-            raise VgiAceroError(str(e)) from e
+            raise wrap_error(e) from e
         return [s.name for s in infos]
 
     def tables(self, schema_name: str) -> list[str]:
         """List table names in `schema_name`."""
+        self._check_not_detached()
         try:
             infos = self._client.schema_contents(
                 attach_opaque_data=self.attach_opaque_data,
@@ -138,11 +161,12 @@ class VgiAceroCatalog:
                 type=SchemaObjectType.TABLE,
             )
         except VGI_CLIENT_ERRORS as e:
-            raise VgiAceroError(str(e)) from e
+            raise wrap_error(e) from e
         return [t.name for t in infos]
 
     def table_functions(self, schema_name: str) -> list[str]:
         """List table function names registered in `schema_name`."""
+        self._check_not_detached()
         try:
             infos = self._client.schema_contents(
                 attach_opaque_data=self.attach_opaque_data,
@@ -150,11 +174,12 @@ class VgiAceroCatalog:
                 type=SchemaObjectType.TABLE_FUNCTION,
             )
         except VGI_CLIENT_ERRORS as e:
-            raise VgiAceroError(str(e)) from e
+            raise wrap_error(e) from e
         return [f.name for f in infos]
 
     def scalar_functions(self, schema_name: str) -> list[str]:
         """List scalar function names registered in `schema_name`."""
+        self._check_not_detached()
         try:
             infos = self._client.schema_contents(
                 attach_opaque_data=self.attach_opaque_data,
@@ -162,7 +187,7 @@ class VgiAceroCatalog:
                 type=SchemaObjectType.SCALAR_FUNCTION,
             )
         except VGI_CLIENT_ERRORS as e:
-            raise VgiAceroError(str(e)) from e
+            raise wrap_error(e) from e
         return [f.name for f in infos]
 
     def table(
@@ -176,12 +201,14 @@ class VgiAceroCatalog:
         doesn't support it on this table rejects the request at bind, the
         same as any other unsupported bind option.
         """
+        self._check_not_detached()
         from vgi_acero.table import VgiAceroTable
 
         return VgiAceroTable(catalog=self, schema_name=schema_name, name=name, at_unit=at_unit, at_value=at_value)
 
     def scalar_function(self, schema_name: str, name: str) -> ScalarFunctionCall:
         """A callable registered as a `pyarrow.compute` scalar UDF (see `_scalar.py`)."""
+        self._check_not_detached()
         from vgi_acero._scalar import make_scalar_function
 
         return make_scalar_function(self, schema_name, name)
@@ -189,7 +216,7 @@ class VgiAceroCatalog:
     def detach(self) -> None:
         """Detach from the catalog and close the underlying client(s).
 
-        Closes every per-thread exchange client `_exchange_client()` created.
+        Closes every per-thread exchange client `exchange_client()` created.
         Safe to call more than once.
         """
         if self._detached:
@@ -199,7 +226,7 @@ class VgiAceroCatalog:
             try:
                 self._client.catalog_detach(attach_opaque_data=self.attach_opaque_data)
             except VGI_CLIENT_ERRORS as e:
-                raise VgiAceroError(str(e)) from e
+                raise wrap_error(e) from e
         finally:
             self._client.stop()
             with self._exchange_clients_lock:
@@ -209,6 +236,16 @@ class VgiAceroCatalog:
                 # block stopping the rest.
                 with contextlib.suppress(Exception):
                     exchange_client.stop()
+
+    def __repr__(self) -> str:
+        """A REPL-friendly summary — `name` plus its schema list (best-effort; never raises)."""
+        if self._detached:
+            return f"VgiAceroCatalog(name={self._name!r}, detached=True)"
+        try:
+            schema_names = self.schemas()
+        except Exception:  # noqa: BLE001 - __repr__ must never raise
+            return f"VgiAceroCatalog(name={self._name!r})"
+        return f"VgiAceroCatalog(name={self._name!r}, schemas={schema_names!r})"
 
     def __enter__(self) -> Self:
         """Support `with attach(...) as catalog:` — returns `self`."""
@@ -273,7 +310,7 @@ def attach(
         """Build one fresh, unstarted `Client` connected the same way every time.
 
         Used both for the initial attach-time client and, via
-        `VgiAceroCatalog._exchange_client()`, once per thread thereafter. No
+        `VgiAceroCatalog.exchange_client()`, once per thread thereafter. No
         `catalog_attach` here — exchange-mode RPCs don't take
         `attach_opaque_data` at all, so a fresh connection is immediately
         usable with no re-attach step.
@@ -306,7 +343,7 @@ def attach(
         )
     except (*VGI_CLIENT_ERRORS, OSError) as e:
         _cleanup()
-        raise VgiAceroError(str(e)) from e
+        raise wrap_error(e) from e
     except BaseException:
         _cleanup()
         raise

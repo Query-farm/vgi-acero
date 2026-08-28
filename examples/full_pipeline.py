@@ -27,7 +27,6 @@ from vgi.arguments import Arguments
 from vgi.client.client import Client
 
 import vgi_acero as va
-from vgi_acero._scan import vgi_scan_splits
 
 
 def _default_worker() -> str:
@@ -55,29 +54,34 @@ def main() -> None:
             c.start()
             return c
 
-        split_result = vgi_scan_splits(
+        # `with` runs close() on exit -- stops every per-split Client
+        # vgi_scan_splits() opened internally, matching the same
+        # `with attach(...) as catalog:` pattern used at the top of main().
+        with va.vgi_scan_splits(
             client_factory,
             schema_name="main",
             function_name="split_sequence",
             arguments=Arguments(named={"n": pa.scalar(30), "splits": pa.scalar(4)}),
-        )
-        try:
+        ) as split_result:
             print("\nsplit-planned union scan:")
             print(ac.Declaration.from_sequence([split_result.declaration]).to_table())
-        finally:
-            split_result.close()  # stop every per-split Client vgi_scan_splits() opened
 
         # 3. Semi-join key pushdown, composed with a real HashJoinNodeOptions.
         build_table = pa.table({"n": pa.array([5, 10, 90], type=pa.int64())})
         build_decl = ac.Declaration("table_source", ac.TableSourceNodeOptions(build_table))
-        probe_client = catalog._exchange_client()
+        # exchange_client() -- never metadata_client -- for anything that
+        # drives table_function()/scalar_function() against this catalog's
+        # attach (see VgiAceroCatalog's own "Thread safety" docstring).
+        probe_client = catalog.exchange_client()
         probe_decl = va.vgi_semi_join_scan(
             probe_client,
             schema_name="main",
             function_name="filter_echo",
             join_column="n",
             build_side_keys=build_table.column("n"),
-            arguments=Arguments(positional=(pa.scalar(100),)),
+            # build_arguments() spares a caller from importing vgi.arguments.Arguments
+            # and pa.scalar(...) by hand for a bare (non-catalog) function call.
+            arguments=va.build_arguments(positional=[100]),
         )
         joined = ac.Declaration(
             "hashjoin",

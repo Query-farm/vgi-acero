@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import pyarrow as pa
 import pyarrow.acero as ac
@@ -57,6 +57,12 @@ class SplitScanResult:
     never before, per `make_vgi_scan_declaration`'s "must be executed"
     caveat, which applies to every one of these clients' open generators.
 
+    Also usable as a context manager: `with vgi_scan_splits(...) as split:
+    table = split.declaration.to_table()` runs `close()` on exit, matching
+    the `with attach(...) as catalog:` pattern this package already uses
+    elsewhere — the plain `try/finally` shown above works too, this is just
+    the more idiomatic PyArrow/Python-shaped spelling of the same thing.
+
     Attributes:
         declaration: The `ac.Declaration("union", ...)` (or, for a
             zero-split result, a `table_source` over an empty table).
@@ -74,6 +80,14 @@ class SplitScanResult:
         """Stop every `Client` this result holds. Safe to call once you're done with `declaration`."""
         for client in self.clients:
             client.stop()
+
+    def __enter__(self) -> Self:
+        """Support `with vgi_scan_splits(...) as split:` — returns `self`."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Support `with vgi_scan_splits(...) as split:` — calls `close()`."""
+        self.close()
 
 
 def make_vgi_scan_declaration(gen: Iterator[pa.RecordBatch]) -> ac.Declaration:

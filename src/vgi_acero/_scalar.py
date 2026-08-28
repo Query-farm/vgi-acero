@@ -57,7 +57,7 @@ from vgi.arguments import Arguments
 from vgi.catalog.catalog_interface import FunctionInfo, FunctionStability, SchemaObjectType
 
 from vgi_acero._arguments import is_const_field, to_scalar
-from vgi_acero.errors import VGI_CLIENT_ERRORS, VgiAceroError
+from vgi_acero.errors import VGI_CLIENT_ERRORS, VgiAceroError, wrap_error
 
 if TYPE_CHECKING:
     from vgi_acero.catalog import VgiAceroCatalog
@@ -109,13 +109,13 @@ def make_scalar_function(catalog: VgiAceroCatalog, schema_name: str, name: str) 
             try:
                 # Catalog-metadata call — the shared client, not a per-thread
                 # exchange one; see catalog.py's "Thread safety" docstring.
-                infos = catalog.client.schema_contents(
+                infos = catalog.metadata_client.schema_contents(
                     attach_opaque_data=catalog.attach_opaque_data,
                     name=schema_name,
                     type=SchemaObjectType.SCALAR_FUNCTION,
                 )
             except VGI_CLIENT_ERRORS as e:
-                raise VgiAceroError(str(e)) from e
+                raise wrap_error(e) from e
             info = next((i for i in infos if i.name == name), None)
             if info is None:
                 raise VgiAceroError(f"scalar function not found: {schema_name}.{name}")
@@ -168,7 +168,7 @@ def make_scalar_function(catalog: VgiAceroCatalog, schema_name: str, name: str) 
                 # threads concurrently during plan execution — must use a
                 # per-thread client, never one shared across calls.
                 out_batches = list(
-                    catalog._exchange_client().scalar_function(
+                    catalog.exchange_client().scalar_function(
                         function_name=name,
                         schema_name=schema_name,
                         input=iter([batch]),
@@ -177,7 +177,7 @@ def make_scalar_function(catalog: VgiAceroCatalog, schema_name: str, name: str) 
                     )
                 )
             except VGI_CLIENT_ERRORS as e:
-                raise VgiAceroError(str(e)) from e
+                raise wrap_error(e) from e
             if not out_batches:
                 empty: pa.Array[Any] = pa.array([], type=out_field.type)
                 return empty

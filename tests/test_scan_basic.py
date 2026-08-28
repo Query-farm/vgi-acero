@@ -16,9 +16,16 @@ import pyarrow as pa
 import pyarrow.acero as ac
 from vgi.arguments import Arguments
 
-from vgi_acero import vgi_scan
+from vgi_acero import build_arguments, vgi_scan
 
 MAIN = "main"
+
+
+def test_build_arguments_avoids_importing_vgi_arguments_directly(client: Any) -> None:
+    """build_arguments() is the public, reachable way to call vgi_scan() without `import vgi.arguments`/`pa.scalar`."""
+    decl = vgi_scan(client, schema_name=MAIN, function_name="filter_echo", arguments=build_arguments(positional=[10]))
+    table = decl.to_table()
+    assert table.num_rows == 10
 
 
 def test_scan_row_count_and_columns(client: Any) -> None:

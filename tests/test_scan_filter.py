@@ -111,6 +111,37 @@ def test_required_filters_enforced_on_the_ordinary_vgi_path(catalog: Any) -> Non
     table_handle.scan(acknowledge_required_filters=True).to_table()
 
 
+def test_scan_rejects_an_unknown_column_name(catalog: Any) -> None:
+    """Regression: pyarrow.Schema.get_field_index() returns -1 (not KeyError) for an unknown name.
+
+    Before this was validated, an unrecognized column silently resolved via
+    Python negative indexing to the LAST real column instead of raising --
+    confirmed live: a typo'd column name returned a real, wrong-column,
+    non-empty table with no exception at all.
+    """
+    from vgi_acero.errors import VgiAceroError
+
+    table_handle = catalog.table("data", "filter_echo_table")
+    try:
+        table_handle.scan(columns=["this_column_does_not_exist"]).to_table()
+        raise AssertionError("expected VgiAceroError for an unknown column name")
+    except VgiAceroError as e:
+        assert "this_column_does_not_exist" in str(e)
+
+
+def test_scan_honors_columns_locally_even_without_projection_pushdown(catalog: Any) -> None:
+    """columns= must always be honored (a local ProjectNodeOptions), same posture filter= already has."""
+    import dataclasses
+
+    table_handle = catalog.table("data", "filter_echo_table")
+    function_info = table_handle._function_info_get()
+    assert function_info is not None
+    no_projection_pushdown = dataclasses.replace(function_info, projection_pushdown=False)
+    table_handle._function_info_get = lambda: no_projection_pushdown  # type: ignore[method-assign]
+    result = table_handle.scan(columns=["n"]).to_table()
+    assert result.schema.names == ["n"]
+
+
 def _translate(client: Any, expr: Any) -> bytes | None:
     """Resolve `filter_echo`'s schema via `Client.bind()` and translate `expr` against it."""
     from vgi_acero._filter_translate import translate_predicate

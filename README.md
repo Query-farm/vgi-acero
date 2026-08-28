@@ -10,7 +10,7 @@ import pyarrow.dataset as ds
 import vgi_acero as va
 
 with va.attach("vgi-fixture-worker", name="example") as catalog:
-    table = catalog.table("main", "filter_echo_table")
+    table = catalog.table("data", "filter_echo_table")
     scan = table.scan(columns=["n", "s"], filter=ds.field("n") >= 8)
 
     plan = ac.Declaration.from_sequence(
@@ -51,10 +51,22 @@ package), `vgi-datafusion` (client, Apache DataFusion/Rust), `vgi-sqlite` (clien
 | Dynamic (intra-stream) filter pushdown | — | ❌ no hook in `pyarrow.acero`'s Python API for a downstream node to feed a bound back to an upstream source mid-execution; see `_topn.py`'s adaptive-requery emulation instead |
 | Catalog/schema/function discovery | `VgiAceroCatalog.schemas()`/`.tables()`/... | ✅ |
 
+## Installing
+
+Not yet published to PyPI. To depend on it today, pin a commit (or the `main` branch) directly:
+
+```bash
+uv add "git+https://github.com/Query-farm/vgi-acero"
+# or: pip install "git+https://github.com/Query-farm/vgi-acero"
+```
+
+This pulls in `vgi-python` (its only real dependency) from PyPI normally — the sibling-checkout
+setup below is only for *developing this repo itself*, not for consuming it.
+
 ## Build / test
 
-Needs a sibling `vgi-python` checkout (`../vgi-python` relative to this repo) — see
-`pyproject.toml`'s `[tool.uv.sources]`.
+Developing this repo needs a sibling `vgi-python` checkout (`../vgi-python` relative to this
+repo) — see `pyproject.toml`'s `[tool.uv.sources]`.
 
 ```bash
 uv sync
